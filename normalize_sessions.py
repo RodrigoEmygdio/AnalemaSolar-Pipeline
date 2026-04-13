@@ -18,8 +18,8 @@ RAW_DIR = BASE_DIR / "raw"
 NORMALIZED_DIR = BASE_DIR / "normalized" / "sessions"
 LOGS_DIR = BASE_DIR / "logs"
 
-# Formato esperado:
-# NVR_ch1_main_20260403120000_20260403130000.dav
+NORMALIZER_VERSION = "1.1"
+
 INTELBRAS_NVR_REGEX = re.compile(
     r"^NVR_(ch\d+)_(main|extra|sub)_(\d{14})_(\d{14})\.dav$"
 )
@@ -184,6 +184,11 @@ def normalize_one_file(file_path: Path, stations: Dict[str, Station], cameras: D
     date_local = start_at_local.date().isoformat()
 
     session_id = build_session_id(station.station_id, camera.camera_id, start_at_local)
+    session_json_path = build_session_json_path(date_local, session_id)
+
+    if session_json_path.exists():
+        print(f"[SKIP] Sessao ja normalizada: {session_id}")
+        return None
 
     raw_target_path = build_raw_target_path(
         station.station_id,
@@ -193,9 +198,12 @@ def normalize_one_file(file_path: Path, stations: Dict[str, Station], cameras: D
     )
     ensure_dir(raw_target_path.parent)
 
-    # Mantemos o bruto original em incoming; copiamos para raw sem destruir origem.
     if not raw_target_path.exists():
         shutil.copy2(file_path, raw_target_path)
+
+    raw_size = raw_target_path.stat().st_size
+    duration_seconds_inferred = int((end_at_local - start_at_local).total_seconds())
+    normalized_at = datetime.now(ZoneInfo(station.timezone)).isoformat()
 
     session_payload = {
         "session_id": session_id,
@@ -213,12 +221,15 @@ def normalize_one_file(file_path: Path, stations: Dict[str, Station], cameras: D
         "date_local": date_local,
         "timezone": station.timezone,
         "raw_rel_path": str(raw_target_path.relative_to(BASE_DIR)),
+        "raw_file_size_bytes": raw_size,
+        "duration_seconds_inferred": duration_seconds_inferred,
+        "normalized_at": normalized_at,
         "processing_status": "normalized",
         "parser_name": camera.parser_name,
-        "parser_version": "1.0"
+        "parser_version": "1.0",
+        "normalizer_version": NORMALIZER_VERSION
     }
 
-    session_json_path = build_session_json_path(date_local, session_id)
     ensure_dir(session_json_path.parent)
 
     with session_json_path.open("w", encoding="utf-8") as f:
@@ -247,12 +258,15 @@ def main() -> None:
     normalized_count = 0
 
     for file_path in files:
-        result = normalize_one_file(file_path, stations, cameras)
-        if result:
-            normalized_count += 1
-            print(f"[OK] Sessao normalizada: {result['session_id']}")
+        try:
+            result = normalize_one_file(file_path, stations, cameras)
+            if result:
+                normalized_count += 1
+                print(f"[OK] Sessao normalizada: {result['session_id']}")
+        except Exception as exc:
+            print(f"[ERROR] Falha ao normalizar {file_path}: {exc}")
 
-    print(f"[INFO] Total de sessoes normalizadas: {normalized_count}")
+    print(f"[INFO] Total de sessoes normalizadas nesta execucao: {normalized_count}")
 
 
 if __name__ == "__main__":
