@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
-from zoneinfo import ZoneInfo
 
 
 BASE_DIR = Path("/srv/analema")
@@ -17,6 +16,7 @@ LOGS_DIR = BASE_DIR / "logs"
 
 FRAME_INTERVAL_SECONDS = 10
 THUMB_WIDTH = 320
+EXTRACTOR_VERSION = "1.2"
 
 
 @dataclass
@@ -87,6 +87,24 @@ def iter_capture_times(start: datetime, end: datetime, step_seconds: int) -> Ite
         current += timedelta(seconds=step_seconds)
 
 
+def get_video_duration_seconds(path: Path) -> int:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    try:
+        return int(float(result.stdout.strip()))
+    except Exception:
+        return 0
+
+
 def extract_single_frame(input_path: Path, offset_seconds: int, output_path: Path) -> bool:
     cmd = [
         "ffmpeg",
@@ -101,7 +119,7 @@ def extract_single_frame(input_path: Path, offset_seconds: int, output_path: Pat
     return result.returncode == 0 and output_path.exists()
 
 
-def create_thumbnail(input_image: Path, output_thumb: Path, width: int = THUMB_WIDTH) -> None:
+def create_thumbnail(input_image: Path, output_thumb: Path, width: int = THUMB_WIDTH) -> bool:
     cmd = [
         "ffmpeg",
         "-y",
@@ -111,14 +129,16 @@ def create_thumbnail(input_image: Path, output_thumb: Path, width: int = THUMB_W
         "-update", "1",
         str(output_thumb),
     ]
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0 and output_thumb.exists()
+
 
 def write_summary(summary_path: Path, payload: dict) -> None:
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def append_ndjson(path: Path, records: list[dict]) -> None:
+def write_ndjson(path: Path, records: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -127,7 +147,8 @@ def append_ndjson(path: Path, records: list[dict]) -> None:
 def already_extracted(session: Session) -> bool:
     out_dir = session_output_dir(session)
     frames_ndjson = out_dir / "metadata" / "frames.ndjson"
-    return frames_ndjson.exists()
+    summary_json = out_dir / "metadata" / "summary.json"
+    return frames_ndjson.exists() and summary_json.exists()
 
 
 def process_session(session: Session) -> None:
@@ -146,13 +167,22 @@ def process_session(session: Session) -> None:
     ensure_dir(metadata_dir)
     ensure_dir(derived_dir)
 
+    real_duration = get_video_duration_seconds(session.raw_abs_path)
+    safe_end = session.start_at_local + timedelta(seconds=real_duration)
+    effective_end = min(session.end_at_local, safe_end)
+
     records: list[dict] = []
+    attempted_frames = 0
+    extracted_frames = 0
+    failed_frames = 0
+    created_thumbs = 0
 
     for captured_at_local in iter_capture_times(
         session.start_at_local,
-        session.end_at_local,
+        effective_end,
         FRAME_INTERVAL_SECONDS,
     ):
+        attempted_frames += 1
         offset_seconds = int((captured_at_local - session.start_at_local).total_seconds())
         clock_str = captured_at_local.strftime("%H-%M-%S")
 
@@ -162,16 +192,22 @@ def process_session(session: Session) -> None:
         frame_path = frames_dir / frame_filename
         thumb_path = thumbs_dir / thumb_filename
 
-        frame_ok = True
-        if not frame_path.exists():
+        frame_ok = frame_path.exists()
+        if not frame_ok:
             frame_ok = extract_single_frame(session.raw_abs_path, offset_seconds, frame_path)
 
         if not frame_ok:
+            failed_frames += 1
             continue
 
-            
-        if not thumb_path.exists():
-            create_thumbnail(frame_path, thumb_path)
+        extracted_frames += 1
+
+        thumb_ok = thumb_path.exists()
+        if not thumb_ok:
+            thumb_ok = create_thumbnail(frame_path, thumb_path)
+
+        if thumb_ok:
+            created_thumbs += 1
 
         frame_id = build_frame_id(session, captured_at_local)
 
@@ -205,7 +241,7 @@ def process_session(session: Session) -> None:
     frames_ndjson = metadata_dir / "frames.ndjson"
     summary_json = metadata_dir / "summary.json"
 
-    append_ndjson(frames_ndjson, records)
+    write_ndjson(frames_ndjson, records)
 
     summary_payload = {
         "session_id": session.session_id,
@@ -215,9 +251,16 @@ def process_session(session: Session) -> None:
         "date_local": session.date_local,
         "start_at_local": session.start_at_local.isoformat(),
         "end_at_local": session.end_at_local.isoformat(),
+        "effective_end_at_local": effective_end.isoformat(),
         "frame_interval_seconds": FRAME_INTERVAL_SECONDS,
+        "duration_real_seconds": real_duration,
+        "attempted_frames": attempted_frames,
         "frame_count": len(records),
-        "status": "frames_extracted"
+        "extracted_frames": extracted_frames,
+        "failed_frames": failed_frames,
+        "created_thumbs": created_thumbs,
+        "status": "frames_extracted",
+        "extractor_version": EXTRACTOR_VERSION
     }
     write_summary(summary_json, summary_payload)
 
@@ -238,8 +281,11 @@ def main() -> None:
             print(f"[SKIP] Sessao ja extraida: {session.session_id}")
             continue
 
-        process_session(session)
-        processed += 1
+        try:
+            process_session(session)
+            processed += 1
+        except Exception as exc:
+            print(f"[ERROR] Falha ao extrair frames de {session.session_id}: {exc}")
 
     print(f"[INFO] Sessoes encontradas: {total}")
     print(f"[INFO] Sessoes processadas agora: {processed}")
